@@ -22,6 +22,9 @@ public class StateMachine<TState, TTrigger>
     where TState : Enum
     where TTrigger : Enum
 {
+    private static readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+    private readonly Action<TriggerResult<TState, TTrigger>>? _changeStateNotifyFunc;
+
     private readonly Action<TState>? _stateUpdateFunc;
 
     private Dictionary<TState, IStateConfiguration<TState, TTrigger>> _configurations = new();
@@ -32,10 +35,14 @@ public class StateMachine<TState, TTrigger>
 
     private TState _state { get; set; }
 
-    public StateMachine(TState state, Action<TState>? stateUpdateFunc)
+    public StateMachine(
+        TState state,
+        Action<TState>? stateUpdateFunc = null,
+        Action<TriggerResult<TState, TTrigger>>? changeStateNotifyFunc = null)
     {
         _state = state;
         _stateUpdateFunc = stateUpdateFunc;
+        _changeStateNotifyFunc = changeStateNotifyFunc;
     }
 
     public IStateConfigurator<TState, TTrigger> Configure(TState state)
@@ -61,42 +68,49 @@ public class StateMachine<TState, TTrigger>
     public void Trigger<TInboxData>(TTrigger trigger, TInboxData inboxData)
     {
         TriggerAsync(trigger, inboxData)
-            .GetAwaiter()
-            .GetResult();
+             .GetAwaiter()
+             .GetResult();
     }
 
-    public async Task TriggerAsync(TTrigger trigger)
+    public Task TriggerAsync(TTrigger trigger)
     {
-        await TriggerAsync<object>(trigger, null!);
+        return TriggerAsync<object>(trigger, null!);
     }
 
     public async Task TriggerAsync<TInboxData>(TTrigger trigger, TInboxData inboxData)
     {
-        if (_configurations.ContainsKey(_state))
+        await _semaphore.WaitAsync();
+        try
         {
-            var configuration = _configurations[_state];
-            var callback = configuration.GetCallback(trigger, inboxData);
-            if (callback == null)
+            if (_configurations.TryGetValue(_state, out var configuration))
             {
-                throw new InvalidOperationException($"Триггер {trigger} не сконфигурирован в статусе {_state}.");
-            }
-
-            await (callback?.InvokeAsync(inboxData) ?? Task.CompletedTask);
-            if (callback?.ChangeState ?? false)
-            {
-                await configuration.OnExitAsyncFunc();
-                _state = callback.NewState!;
-                _stateUpdateFunc?.Invoke(_state);
-                if (_configurations.ContainsKey(_state))
+                var callback = configuration.GetCallback(trigger, inboxData)
+                        ?? throw new InvalidOperationException($"Триггер {trigger} не сконфигурирован в статусе {_state}.");
+                await (callback?.InvokeAsync(inboxData) ?? Task.CompletedTask);
+                if (callback?.ChangeState ?? false)
                 {
-                    configuration = _configurations[_state];
-                    await configuration.OnEntryAsyncFunc();
+                    await configuration.OnExitAsyncFunc();
+                    var oldState = _state;
+                    _state = callback.NewState!;
+                    _stateUpdateFunc?.Invoke(_state);
+                    if (_configurations.TryGetValue(_state, out configuration))
+                    {
+                        await configuration.OnEntryAsyncFunc();
+                    }
+                    var result = new TriggerResult<TState, TTrigger>(trigger, oldState, _state);
+                    _changeStateNotifyFunc?.Invoke(result);
                 }
+
+                return;
             }
 
-            return;
+            throw new InvalidOperationException($"Статус {_state} не сконфигурирован.");
         }
-
-        throw new InvalidOperationException($"Статус {_state} не сконфигурирован.");
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 }
+
+public record class TriggerResult<TState, TTrigger>(TTrigger Trigger, TState OldState, TState NewState);
